@@ -1,0 +1,126 @@
+/* Vollkorn */
+
+@font-face {
+    font-family: 'Vollkorn';
+    font-style: normal;
+    font-weight: 400;
+    src: url(vollkorn-regular-webfont.woff) format('woff');
+}
+
+@font-face {
+    font-family: 'Vollkorn';
+    font-style: italic;
+    font-weight: 400;
+    src: url(vollkorn-italic-webfont.woff) format('woff');
+}
+
+@font-face {
+    font-family: 'Vollkorn';
+	font-style: normal;
+    font-weight: 600;
+    src: url(vollkorn-semibold-webfont.woff) format('woff');
+}
+
+/* Fonts */
+
+body {
+	font-family: 'Vollkorn', serif;
+	margin: 0.25in 0.75in;
+}
+
+h1 {
+	margin-top: 0.25in;
+	margin-bottom: 0.25in;
+	text-align: center;
+	font-style: italic;
+	color: DarkRed;
+}
+
+
+h2 {
+	margin-top: 0.25in;
+	text-align: center;
+	font-size:125%
+}
+
+h3 {
+	margin-top: 0.5in;
+	text-align: center;
+}
+
+h4 {
+	margin: 1ex 0ex;
+}
+
+ul li {
+	margin: 1ex 0ex;
+}
+
+ul li.lookitme {
+	margin: 1ex 0ex;
+	background-color: #ffb;
+}
+
+dt {
+	float: left;
+	clear: left;
+	width: 6.5em;
+	padding: 0 0 0 0.5em;
+	text-align: right;
+	font-weight: bold;
+}
+
+dd {
+	margin: 0 0 0 7.5em;
+	padding: 0 0.5em;
+	border-left: 1px solid #888;
+}
+
+dd.section {
+	text-align: center;
+	font-weight: bold;
+	background-color: #eee;
+	border-left: 0;
+}
+
+p {
+	text-align: justify;
+	font-size: 100%;
+}
+
+span.about {
+	font-style: italic;
+	font-size:80%;
+}
+
+span.init {
+	font-style:italic;
+	font-weight:bold
+}
+
+span.here {
+	background-color:#ffc;
+}
+
+div.floater {
+	background-color: white;
+	font-family: Optima, Verdana, Sans Serif;
+	width: 1.5in;
+	margin: 1ex 2ex;
+	padding: 2ex;
+	float: right;
+	font-size: 75%;
+	text-align: center;
+	border: 1px solid #888
+}
+
+div.floatertwo {
+	font-family: Optima, Verdana, Sans Serif;
+	width: 1.5in;
+	margin: 10ex 0ex 2ex 2ex;
+	padding: 2ex;
+	float: right;
+	font-size: 75%;
+	text-align: center;
+	border: 1px solid #888
+}
