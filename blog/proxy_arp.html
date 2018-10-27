@@ -1,0 +1,627 @@
+<!DOCTYPE html>
+<html lang="en-US">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Openstack DVR Code Analysis | Jshen&#39; blog</title>
+    <meta name="description" content="Analyze openstack neutron source code in order to find out how is DVR implemented. Traffic from VM without any floating ip will still flow through a centralized gateway node to access internet resource; while vm with floating ip could directly goes outside from the compute node.">
+    
+    
+    <link rel="preload" href="/assets/css/0.styles.4568b041.css" as="style"><link rel="preload" href="/assets/js/app.c3760c75.js" as="script"><link rel="preload" href="/assets/js/7.642f35ed.js" as="script"><link rel="prefetch" href="/assets/js/2.4ce87602.js"><link rel="prefetch" href="/assets/js/3.cdce1895.js"><link rel="prefetch" href="/assets/js/4.32dd484f.js"><link rel="prefetch" href="/assets/js/5.1f2a87cb.js"><link rel="prefetch" href="/assets/js/6.4fbc35f1.js">
+    <link rel="stylesheet" href="/assets/css/0.styles.4568b041.css">
+  </head>
+  <body>
+    <div id="app" data-server-rendered="true"><div class="theme-container"><header class="navbar"><div class="sidebar-button"><svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" role="img" viewBox="0 0 448 512" class="icon"><path fill="currentColor" d="M436 124H12c-6.627 0-12-5.373-12-12V80c0-6.627 5.373-12 12-12h424c6.627 0 12 5.373 12 12v32c0 6.627-5.373 12-12 12zm0 160H12c-6.627 0-12-5.373-12-12v-32c0-6.627 5.373-12 12-12h424c6.627 0 12 5.373 12 12v32c0 6.627-5.373 12-12 12zm0 160H12c-6.627 0-12-5.373-12-12v-32c0-6.627 5.373-12 12-12h424c6.627 0 12 5.373 12 12v32c0 6.627-5.373 12-12 12z"></path></svg></div> <a href="/" class="home-link router-link-active"><!----> <span class="site-name">Jshen' blog</span></a> <div class="links" style="max-width:nullpx;"><div class="search-box"><input aria-label="Search" autocomplete="off" spellcheck="false" value=""> <!----></div> <nav class="nav-links can-hide"><div class="nav-item"><a href="/" class="nav-link">Home</a></div><div class="nav-item"><a href="/blog/" class="nav-link router-link-active">Blog</a></div> <!----></nav></div></header> <div class="sidebar-mask"></div> <div class="sidebar"><nav class="nav-links"><div class="nav-item"><a href="/" class="nav-link">Home</a></div><div class="nav-item"><a href="/blog/" class="nav-link router-link-active">Blog</a></div> <!----></nav>  <ul class="sidebar-links"><li><a href="/" class="sidebar-link">WELCOME</a></li><li><a href="/blog/" class="sidebar-link">Openstack Staff</a></li></ul> </div> <div class="page"> <div class="content"><h1 id="random-thought-on-proxy-arp"><a href="#random-thought-on-proxy-arp" aria-hidden="true" class="header-anchor">#</a> RANDOM THOUGHT ON PROXY ARP</h1> <p>Openstack neutron <code>dvr</code> mode relies on proxy arp to provide floating ip service. So I would like to dig in and find out how it implements both in terms of linux and neutron source code. By understanding the basics, it will do great help to understand what is going on under the hood.</p> <h2 id="demo"><a href="#demo" aria-hidden="true" class="header-anchor">#</a> DEMO</h2> <p>In this section, I would like to present you how to do a demo proxy arp in a Unbuntu 16.04 virtual machine. For simplicity I use a network namespace to offer a network isolation. I admit to feel uncomfortable with iptables but nevermind it is not necessary unless you want to really <strong>talk</strong> to the proxied nic.</p> <h3 id="prepare-system-conf"><a href="#prepare-system-conf" aria-hidden="true" class="header-anchor">#</a> PREPARE SYSTEM CONF</h3> <div class="language-bash extra-class"><pre class="language-bash"><code><span class="token comment"># sysctl could be used to check system configurations</span>
+<span class="token comment"># make sure that following values to be 1</span>
+sysctl net.ipv4.conf.<span class="token variable">${NIC}</span>.proxy_arp
+sysctl net.ipv4.ip_forward
+
+<span class="token comment"># if above is not 1</span>
+<span class="token comment"># then manually set it to 1</span>
+<span class="token comment"># ssyctl -w net.ipv4.conf.all.proxy_arp=1</span>
+sysctl -w net.ipv4.conf.<span class="token variable">${NIC}</span>.proxy_arp<span class="token operator">=</span>1
+sysctl -w net.ipv4.ip_forward<span class="token operator">=</span>1
+</code></pre></div><h3 id="network-birdview"><a href="#network-birdview" aria-hidden="true" class="header-anchor">#</a> NETWORK BIRDVIEW</h3> <div class="language-raw extra-class"><pre class="language-text"><code># ----------              -----------
+# |        |              |         |
+# | net 1  |   &lt;------&gt;   |  net 2  |
+# | proxy  |              |  netns  |
+# |        |              |         |
+# ----------              -----------
+</code></pre></div><h3 id="create-netns-veth-pair"><a href="#create-netns-veth-pair" aria-hidden="true" class="header-anchor">#</a> CREATE NETNS &amp; VETH PAIR</h3> <div class="language-bash extra-class"><pre class="language-bash"><code>ip netns add <span class="token variable">${NS_NAME}</span>
+ip <span class="token function">link</span> add <span class="token variable">${VETH0}</span> <span class="token function">type</span> veth peer name <span class="token variable">${VETH1}</span>
+ip <span class="token function">link</span> <span class="token keyword">set</span> <span class="token variable">${VETH1}</span> netns <span class="token variable">${NS_NAME}</span>
+
+<span class="token comment"># give them ip addresses</span>
+ip addr add <span class="token variable">${VETH0_CIRD}</span> dev <span class="token variable">${VETH0}</span>
+ip <span class="token function">link</span> <span class="token keyword">set</span> <span class="token variable">${VETH0_CIRD}</span> up
+ip netns <span class="token function">exec</span> <span class="token variable">${NS_NAME}</span> ip addr add <span class="token variable">${VETH1_CIRD}</span> dev <span class="token variable">${VETH1}</span>
+ip netns <span class="token function">exec</span> <span class="token variable">${NS_NAME}</span> ip <span class="token function">link</span> <span class="token keyword">set</span> <span class="token variable">${VETH1}</span> up
+
+<span class="token comment"># test connectivity by ping</span>
+ip netns <span class="token function">exec</span> <span class="token variable">${NS_NAME}</span> <span class="token function">ping</span> <span class="token variable">${VETH0_ADDR}</span>
+</code></pre></div><h3 id="setup-proxy-arp"><a href="#setup-proxy-arp" aria-hidden="true" class="header-anchor">#</a> SETUP PROXY ARP</h3> <div class="language-bash extra-class"><pre class="language-bash"><code>ip route add to <span class="token variable">${PROXIED_IPADDR}</span> via <span class="token variable">${ANOTHER_IPADDR_ON_VM}</span>
+
+<span class="token comment"># try arping in another namespace</span>
+<span class="token comment"># install arping if it is not present</span>
+ip netns <span class="token function">exec</span> <span class="token variable">${NS_NAME}</span> arping <span class="token variable">${VETH0}</span>
+</code></pre></div><h3 id="proxy-arp-references"><a href="#proxy-arp-references" aria-hidden="true" class="header-anchor">#</a> PROXY ARP REFERENCES</h3> <p>Threads I've read</p> <ul><li><a href="http://www.cnblogs.com/sammyliu/p/4713562.html" target="_blank" rel="noopener noreferrer">a good reference on dvr implementation<svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" x="0px" y="0px" viewBox="0 0 100 100" width="15" height="15" class="icon outbound"><path fill="currentColor" d="M18.8,85.1h56l0,0c2.2,0,4-1.8,4-4v-32h-8v28h-48v-48h28v-8h-32l0,0c-2.2,0-4,1.8-4,4v56C14.8,83.3,16.6,85.1,18.8,85.1z"></path> <polygon fill="currentColor" points="45.7,48.7 51.3,54.3 77.2,28.5 77.2,37.2 85.2,37.2 85.2,14.9 62.8,14.9 62.8,22.9 71.5,22.9"></polygon></svg></a></li> <li><a href="https://assafmuller.com/2015/04/15/distributed-virtual-routing-floating-ips/" target="_blank" rel="noopener noreferrer">mostly refered to article on dvr and ovs<svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" x="0px" y="0px" viewBox="0 0 100 100" width="15" height="15" class="icon outbound"><path fill="currentColor" d="M18.8,85.1h56l0,0c2.2,0,4-1.8,4-4v-32h-8v28h-48v-48h28v-8h-32l0,0c-2.2,0-4,1.8-4,4v56C14.8,83.3,16.6,85.1,18.8,85.1z"></path> <polygon fill="currentColor" points="45.7,48.7 51.3,54.3 77.2,28.5 77.2,37.2 85.2,37.2 85.2,14.9 62.8,14.9 62.8,22.9 71.5,22.9"></polygon></svg></a></li> <li><a href="https://infosec-neo.blogspot.com/2007/07/how-to-implement-proxy-arp-on-linux-box.html" target="_blank" rel="noopener noreferrer">set up proxy arp<svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" x="0px" y="0px" viewBox="0 0 100 100" width="15" height="15" class="icon outbound"><path fill="currentColor" d="M18.8,85.1h56l0,0c2.2,0,4-1.8,4-4v-32h-8v28h-48v-48h28v-8h-32l0,0c-2.2,0-4,1.8-4,4v56C14.8,83.3,16.6,85.1,18.8,85.1z"></path> <polygon fill="currentColor" points="45.7,48.7 51.3,54.3 77.2,28.5 77.2,37.2 85.2,37.2 85.2,14.9 62.8,14.9 62.8,22.9 71.5,22.9"></polygon></svg></a></li> <li><a href="http://www.linuxproblem.org/art_8.html" target="_blank" rel="noopener noreferrer">how to enable/disable proxy arp in linux<svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" x="0px" y="0px" viewBox="0 0 100 100" width="15" height="15" class="icon outbound"><path fill="currentColor" d="M18.8,85.1h56l0,0c2.2,0,4-1.8,4-4v-32h-8v28h-48v-48h28v-8h-32l0,0c-2.2,0-4,1.8-4,4v56C14.8,83.3,16.6,85.1,18.8,85.1z"></path> <polygon fill="currentColor" points="45.7,48.7 51.3,54.3 77.2,28.5 77.2,37.2 85.2,37.2 85.2,14.9 62.8,14.9 62.8,22.9 71.5,22.9"></polygon></svg></a></li></ul> <h2 id="iptables-usages"><a href="#iptables-usages" aria-hidden="true" class="header-anchor">#</a> IPTABLES USAGES</h2> <h2 id="north-south-traffic"><a href="#north-south-traffic" aria-hidden="true" class="header-anchor">#</a> NORTH-SOUTH TRAFFIC</h2> <h2 id="neutron-code-analysis"><a href="#neutron-code-analysis" aria-hidden="true" class="header-anchor">#</a> NEUTRON CODE ANALYSIS</h2> <h3 id="ml2-plugin-extension"><a href="#ml2-plugin-extension" aria-hidden="true" class="header-anchor">#</a> ML2 PLUGIN (EXTENSION)</h3> <p>Resource (resource map) are extended by extension plugins.</p> <ul><li>neutron manager initialize, <code>_load_service_plugins</code>, namespace: <code>neutron.service_plugins</code>.</li> <li><code>L3_ROUTER_NAT</code> connects extension with service plugin; <code>neutron.services.l3_router.l3_router_plugin.L3RouterPlugin#get_plugin_type</code></li> <li>ExtensionManager loads extensions (default: neutron/extension)</li> <li>Extension(ExtensionDesriptor) got method <code>get_resource</code> which will return a collection of object having both controller and plugin etc.</li> <li>l3 agent service callbacks are registerd at <code>neutron.services.l3_router.l3_router_plugin.L3RouterPlugin#__init__</code>.</li> <li>fip port is created here <code>neutron.agent.l3.dvr_fip_ns.FipNamespace#_create_gateway_port</code>, <code>dvr_fip_ns.py</code> implements specific fip namespace.</li> <li>router updated notification is received &amp; responsed <code>neutron.agent.l3.agent.L3NATAgent#_process_router_update</code>.</li> <li>process router with <code>neutron.agent.l3.agent.L3NATAgent#_process_router_if_compatible</code> if it does not exis or <code>self.router_info</code> is not intialized</li> <li>For south-north traffic, traffic originated from VM will first be sent to <strong>local router</strong>, and then go all the way to <strong>snat namespace</strong>; the reply packet will first hit <strong>snat</strong>, then dvr router on <strong>network node</strong>, and finally return to VM. So basically packet will go throught different path which could be easily verified by <code>tcpdump</code>.</li> <li>gratuitous arp for updating arp tables of on-link devices.</li></ul> <p><strong>Router</strong> and <strong>Floating</strong> are all handled by service plugin named <code>L3RouterPlugin</code> and extension named <code>L3</code> in <code>extensions/l3.py</code> whereas extension extends rest api with extra controllers and service plugin offers method for the specific controller. How each extension is loaded depends on which neutron frontend framework is adopted, there are two frameworks exist, one for python paste and another one is for pecan. It is believed that the latter is going to replace legacy one, so I'm going to talk about api chain with the latter in the following chapter; but both of them share significant similiarities so analysis here should go fit another quite easily.</p> <h4 id="initialization-process"><a href="#initialization-process" aria-hidden="true" class="header-anchor">#</a> INITIALIZATION PROCESS</h4> <p>Initialization takes place at <code>neutron.pecan_wsgi.startup.initialize_all</code>. It first loads ml2 plugin which handles networks, subnets and ports. Then it will load all the extensions,</p> <div class="language-python extra-class"><pre class="language-python"><code><span class="token keyword">def</span> <span class="token function">initalize_all</span><span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token comment"># skip code block</span>
+    resources <span class="token operator">=</span> ext_mgr<span class="token punctuation">.</span>get_resources<span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre></div><p>Here resources could be interpreted as neutron managed objects, such as network, router, etc. More specifically it is list concatenation of return from <code>neutron_lib.api.extensions.ExtensionDescriptor#get_resources</code>. Then code traverses all the resources (except default) and register controllers in <code>NeutronManager</code>. Until now, controllers are registered and related requests should be handled properly.</p> <h4 id="rest-api-entrance"><a href="#rest-api-entrance" aria-hidden="true" class="header-anchor">#</a> REST API ENTRANCE</h4> <p>Neutron has a unique flavor of defining method name as a combination of <strong>action</strong> (update, create) and <strong>resource</strong> (network, router), remember the fact that plugins are actual executor for a controller, it then become an obvious guess that floating ip creation method could be found in <code>L3RouterPlugin</code>. It is actually there with name <code>create_floatingip</code>. But keep in mind that it is possible that above guess is not correct, because besides typical naming convention, an action map could also be passed in to handle non-canonical request. Go to <code>get_resources</code> method and checkout how <strong>action map</strong> is initialized there.</p> <div class="language-python extra-class"><pre class="language-python"><code>@resource_extend<span class="token punctuation">.</span>has_resource_extenders
+<span class="token keyword">class</span> <span class="token class-name">L3RouterPlugin</span><span class="token punctuation">(</span>service_base<span class="token punctuation">.</span>ServicePluginBase<span class="token punctuation">,</span>
+                     common_db_mixin<span class="token punctuation">.</span>CommonDbMixin<span class="token punctuation">,</span>
+                     extraroute_db<span class="token punctuation">.</span>ExtraRoute_db_mixin<span class="token punctuation">,</span>
+                     l3_hamode_db<span class="token punctuation">.</span>L3_HA_NAT_db_mixin<span class="token punctuation">,</span>
+                     l3_gwmode_db<span class="token punctuation">.</span>L3_NAT_db_mixin<span class="token punctuation">,</span>
+                     l3_dvr_ha_scheduler_db<span class="token punctuation">.</span>L3_DVR_HA_scheduler_db_mixin<span class="token punctuation">,</span>
+                     dns_db<span class="token punctuation">.</span>DNSDbMixin<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">create_floatingip</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> context<span class="token punctuation">,</span> floatingip<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token triple-quoted-string string">&quot;&quot;&quot;Create floating IP.
+
+        :param context: Neutron request context
+        :param floatingip: data for the floating IP being created
+        :returns: A floating IP object on success
+
+        As the l3 router plugin asynchronously creates floating IPs
+        leveraging the l3 agent, the initial status for the floating
+        IP object will be DOWN.
+        &quot;&quot;&quot;</span>
+        <span class="token keyword">return</span> <span class="token builtin">super</span><span class="token punctuation">(</span>L3RouterPlugin<span class="token punctuation">,</span> self<span class="token punctuation">)</span><span class="token punctuation">.</span>create_floatingip<span class="token punctuation">(</span>
+            context<span class="token punctuation">,</span> floatingip<span class="token punctuation">,</span>
+            initial_status<span class="token operator">=</span>n_const<span class="token punctuation">.</span>FLOATINGIP_STATUS_DOWN<span class="token punctuation">)</span>
+
+
+<span class="token keyword">class</span> <span class="token class-name">L3_NAT_db_mixin</span><span class="token punctuation">(</span>L3_NAT_dbonly_mixin<span class="token punctuation">,</span> L3RpcNotifierMixin<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">create_floatingip</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> context<span class="token punctuation">,</span> floatingip<span class="token punctuation">,</span>
+            initial_status<span class="token operator">=</span>constants<span class="token punctuation">.</span>FLOATINGIP_STATUS_ACTIVE<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        floatingip_dict <span class="token operator">=</span> <span class="token builtin">super</span><span class="token punctuation">(</span>L3_NAT_db_mixin<span class="token punctuation">,</span> self<span class="token punctuation">)</span><span class="token punctuation">.</span>create_floatingip<span class="token punctuation">(</span>
+            context<span class="token punctuation">,</span> floatingip<span class="token punctuation">,</span> initial_status<span class="token punctuation">)</span>
+        router_id <span class="token operator">=</span> floatingip_dict<span class="token punctuation">[</span><span class="token string">'router_id'</span><span class="token punctuation">]</span>
+        self<span class="token punctuation">.</span>notify_router_updated<span class="token punctuation">(</span>context<span class="token punctuation">,</span> router_id<span class="token punctuation">,</span> <span class="token string">'create_floatingip'</span><span class="token punctuation">)</span>
+        <span class="token keyword">return</span> floatingip_dict
+
+
+@registry<span class="token punctuation">.</span>has_registry_receivers
+<span class="token keyword">class</span> <span class="token class-name">L3_NAT_dbonly_mixin</span><span class="token punctuation">(</span>l3<span class="token punctuation">.</span>RouterPluginBase<span class="token punctuation">,</span>
+                          base_services<span class="token punctuation">.</span>WorkerBase<span class="token punctuation">,</span>
+                          st_attr<span class="token punctuation">.</span>StandardAttrDescriptionMixin<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token triple-quoted-string string">&quot;&quot;&quot;Mixin class to add L3/NAT router methods to db_base_plugin_v2.&quot;&quot;&quot;</span>
+    @db_api<span class="token punctuation">.</span>retry_if_session_inactive<span class="token punctuation">(</span><span class="token punctuation">)</span>
+    <span class="token keyword">def</span> <span class="token function">create_floatingip</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> context<span class="token punctuation">,</span> floatingip<span class="token punctuation">,</span>
+            initial_status<span class="token operator">=</span>constants<span class="token punctuation">.</span>FLOATINGIP_STATUS_ACTIVE<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">return</span> self<span class="token punctuation">.</span>_create_floatingip<span class="token punctuation">(</span>context<span class="token punctuation">,</span> floatingip<span class="token punctuation">,</span> initial_status<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">_create_floatingip</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> context<span class="token punctuation">,</span> floatingip<span class="token punctuation">,</span>
+        initial_status<span class="token operator">=</span>constants<span class="token punctuation">.</span>FLOATINGIP_STATUS_ACTIVE<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token comment"># create db entry</span>
+
+        <span class="token comment"># callbackup, but for now callback is not registered</span>
+        registry<span class="token punctuation">.</span>notify<span class="token punctuation">(</span>resources<span class="token punctuation">.</span>FLOATING_IP<span class="token punctuation">,</span>
+                events<span class="token punctuation">.</span>AFTER_UPDATE<span class="token punctuation">,</span>
+                self<span class="token punctuation">.</span>_update_fip_assoc<span class="token punctuation">,</span> <span class="token operator">**</span>assoc_result<span class="token punctuation">)</span>
+</code></pre></div><p>As above code shows, l3 router plugin handles db entry creation (floating ip) and agent notificiation (instead of a rpc call/cast). The logic is written in <code>neutron.db.l3_db.L3_NAT_dbonly_mixin#_create_floatingip</code>, it will test if network is external or contains a subnet, if succeeds, then a port with external ip is created. After port has been created, floating ip entry will have information and will be ready to create a new db record.</p> <p>So what is clear from above snippet is that <strong>real port</strong> is created by <strong>l3-agent</strong> from notifications. So next step will be analyzing how <strong>l3-agent</strong> works. The notification is <code>routers_updated</code> which action is secretly dropped by <code>neutron.api.rpc.agentnotifiers.l3_rpc_agent_api.L3AgentNotifyAPI#_agent_notification_arp</code>, but it does not matter.</p> <h4 id="l3-agent-handles-notification"><a href="#l3-agent-handles-notification" aria-hidden="true" class="header-anchor">#</a> L3-AGENT HANDLES NOTIFICATION</h4> <p>By design rpc calls will be handled by method of the same name here it is <code>routers_updated</code>, this method is nowhere but <code>neutron.agent.l3.agent.L3NATAgent#routers_updated</code>, noticing that <code>L3NATAgentWithStateReport</code>, which is a manager class, is a sub class of <code>L3NATAgent</code></p> <div class="language-python extra-class"><pre class="language-python"><code><span class="token keyword">class</span> <span class="token class-name">L3NATAgent</span><span class="token punctuation">(</span>ha<span class="token punctuation">.</span>AgentMixin<span class="token punctuation">,</span>
+                 dvr<span class="token punctuation">.</span>AgentMixin<span class="token punctuation">,</span>
+                 manager<span class="token punctuation">.</span>Manager<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token triple-quoted-string string">&quot;&quot;&quot;Manager for L3NatAgent&quot;&quot;&quot;</span>
+
+    <span class="token keyword">def</span> <span class="token function">routers_updated</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> context<span class="token punctuation">,</span> routers<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token triple-quoted-string string">&quot;&quot;&quot;Deal with routers modification and creation RPC message.&quot;&quot;&quot;</span>
+        <span class="token keyword">if</span> routers<span class="token punctuation">:</span>
+            <span class="token comment"># This is needed for backward compatibility</span>
+            <span class="token keyword">if</span> <span class="token builtin">isinstance</span><span class="token punctuation">(</span>routers<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span><span class="token punctuation">,</span> <span class="token builtin">dict</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+                routers <span class="token operator">=</span> <span class="token punctuation">[</span>router<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span> <span class="token keyword">for</span> router <span class="token keyword">in</span> routers<span class="token punctuation">]</span>
+            <span class="token keyword">for</span> <span class="token builtin">id</span> <span class="token keyword">in</span> routers<span class="token punctuation">:</span>
+                update <span class="token operator">=</span> queue<span class="token punctuation">.</span>RouterUpdate<span class="token punctuation">(</span><span class="token builtin">id</span><span class="token punctuation">,</span> queue<span class="token punctuation">.</span>PRIORITY_RPC<span class="token punctuation">)</span>
+                self<span class="token punctuation">.</span>_queue<span class="token punctuation">.</span>add<span class="token punctuation">(</span>update<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">after_start</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        eventlet<span class="token punctuation">.</span>spawn_n<span class="token punctuation">(</span>self<span class="token punctuation">.</span>_process_routers_loop<span class="token punctuation">)</span>
+        LOG<span class="token punctuation">.</span>info<span class="token punctuation">(</span><span class="token string">&quot;L3 agent started&quot;</span><span class="token punctuation">)</span>
+
+
+@profiler<span class="token punctuation">.</span>trace_cls<span class="token punctuation">(</span><span class="token string">&quot;l3-agent&quot;</span><span class="token punctuation">)</span>
+<span class="token keyword">class</span> <span class="token class-name">L3NATAgent</span><span class="token punctuation">(</span>ha<span class="token punctuation">.</span>AgentMixin<span class="token punctuation">,</span>
+                 dvr<span class="token punctuation">.</span>AgentMixin<span class="token punctuation">,</span>
+                 manager<span class="token punctuation">.</span>Manager<span class="token punctuation">)</span><span class="token punctuation">:</span>
+
+    <span class="token comment"># spawn eventlet to handle router update uqueue</span>
+    <span class="token keyword">def</span> <span class="token function">_process_routers_loop</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;Starting _process_routers_loop&quot;</span><span class="token punctuation">)</span>
+        pool <span class="token operator">=</span> eventlet<span class="token punctuation">.</span>GreenPool<span class="token punctuation">(</span>size<span class="token operator">=</span><span class="token number">8</span><span class="token punctuation">)</span>
+        <span class="token keyword">while</span> <span class="token boolean">True</span><span class="token punctuation">:</span>
+            pool<span class="token punctuation">.</span>spawn_n<span class="token punctuation">(</span>self<span class="token punctuation">.</span>_process_router_update<span class="token punctuation">)</span>
+
+    <span class="token comment"># process candidates</span>
+    <span class="token keyword">def</span> <span class="token function">_process_router_update</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">for</span> rp<span class="token punctuation">,</span> update <span class="token keyword">in</span> self<span class="token punctuation">.</span>_queue<span class="token punctuation">.</span>each_update_to_next_router<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+            router <span class="token operator">=</span> update<span class="token punctuation">.</span>router
+            <span class="token keyword">if</span> update<span class="token punctuation">.</span>action <span class="token operator">!=</span> queue<span class="token punctuation">.</span>DELETE_ROUTER <span class="token operator">and</span> <span class="token operator">not</span> router<span class="token punctuation">:</span>
+                <span class="token keyword">try</span><span class="token punctuation">:</span>
+                    update<span class="token punctuation">.</span>timestamp <span class="token operator">=</span> timeutils<span class="token punctuation">.</span>utcnow<span class="token punctuation">(</span><span class="token punctuation">)</span>
+                    <span class="token comment"># initialize router object by given id</span>
+                    routers <span class="token operator">=</span> self<span class="token punctuation">.</span>plugin_rpc<span class="token punctuation">.</span>get_routers<span class="token punctuation">(</span>self<span class="token punctuation">.</span>context<span class="token punctuation">,</span>
+                                                          <span class="token punctuation">[</span>update<span class="token punctuation">.</span><span class="token builtin">id</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+                <span class="token keyword">except</span> Exception<span class="token punctuation">:</span>
+                    <span class="token keyword">continue</span>
+
+                <span class="token keyword">if</span> routers<span class="token punctuation">:</span>
+                    router <span class="token operator">=</span> routers<span class="token punctuation">[</span><span class="token number">0</span><span class="token punctuation">]</span>
+
+            <span class="token keyword">try</span><span class="token punctuation">:</span>
+                <span class="token comment"># process router if it should be handled locally</span>
+                self<span class="token punctuation">.</span>_process_router_if_compatible<span class="token punctuation">(</span>router<span class="token punctuation">)</span>
+            <span class="token keyword">except</span> Exception <span class="token keyword">as</span> e<span class="token punctuation">:</span>
+                <span class="token keyword">continue</span>
+
+    <span class="token keyword">def</span> <span class="token function">_process_router_if_compatible</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> router<span class="token punctuation">)</span><span class="token punctuation">:</span>
+
+        <span class="token comment"># If target_ex_net_id and ex_net_id are set they must be equal</span>
+        target_ex_net_id <span class="token operator">=</span> self<span class="token punctuation">.</span>_fetch_external_net_id<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>target_ex_net_id <span class="token operator">and</span> ex_net_id <span class="token operator">and</span> ex_net_id <span class="token operator">!=</span> target_ex_net_id<span class="token punctuation">)</span><span class="token punctuation">:</span>
+            <span class="token comment"># Double check that our single external_net_id has not changed</span>
+            <span class="token comment"># by forcing a check by RPC.</span>
+            <span class="token keyword">if</span> ex_net_id <span class="token operator">!=</span> self<span class="token punctuation">.</span>_fetch_external_net_id<span class="token punctuation">(</span>force<span class="token operator">=</span><span class="token boolean">True</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+                <span class="token keyword">raise</span> n_exc<span class="token punctuation">.</span>RouterNotCompatibleWithAgent<span class="token punctuation">(</span>
+                    router_id<span class="token operator">=</span>router<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+        <span class="token keyword">if</span> router<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span> <span class="token operator">not</span> <span class="token keyword">in</span> self<span class="token punctuation">.</span>router_info<span class="token punctuation">:</span>
+            <span class="token comment"># If router does not exists or service has been restarted</span>
+            <span class="token comment"># reinitialize instance</span>
+            self<span class="token punctuation">.</span>_process_added_router<span class="token punctuation">(</span>router<span class="token punctuation">)</span>
+        <span class="token keyword">else</span><span class="token punctuation">:</span>
+            <span class="token comment"># if router already there, then update it directly</span>
+            self<span class="token punctuation">.</span>_process_updated_router<span class="token punctuation">(</span>router<span class="token punctuation">)</span>
+
+
+    <span class="token comment"># update router</span>
+    <span class="token keyword">def</span> <span class="token function">_process_updated_router</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> router<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        ri <span class="token operator">=</span> self<span class="token punctuation">.</span>router_info<span class="token punctuation">[</span>router<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">]</span>
+        is_dvr_only_agent <span class="token operator">=</span> <span class="token punctuation">(</span>self<span class="token punctuation">.</span>conf<span class="token punctuation">.</span>agent_mode <span class="token keyword">in</span>
+                            <span class="token punctuation">[</span>lib_const<span class="token punctuation">.</span>L3_AGENT_MODE_DVR<span class="token punctuation">,</span>
+                            l3_constants<span class="token punctuation">.</span>L3_AGENT_MODE_DVR_NO_EXTERNAL<span class="token punctuation">]</span><span class="token punctuation">)</span>
+        is_ha_router <span class="token operator">=</span> <span class="token builtin">getattr</span><span class="token punctuation">(</span>ri<span class="token punctuation">,</span> <span class="token string">'ha_state'</span><span class="token punctuation">,</span> <span class="token boolean">None</span><span class="token punctuation">)</span> <span class="token keyword">is</span> <span class="token operator">not</span> <span class="token boolean">None</span>
+        <span class="token comment"># For HA routers check that DB state matches actual state</span>
+        <span class="token keyword">if</span> router<span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'ha'</span><span class="token punctuation">)</span> <span class="token operator">and</span> <span class="token operator">not</span> is_dvr_only_agent <span class="token operator">and</span> is_ha_router<span class="token punctuation">:</span>
+            self<span class="token punctuation">.</span>check_ha_state_for_router<span class="token punctuation">(</span>
+                router<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">,</span> router<span class="token punctuation">.</span>get<span class="token punctuation">(</span>l3_constants<span class="token punctuation">.</span>HA_ROUTER_STATE_KEY<span class="token punctuation">)</span><span class="token punctuation">)</span>
+        ri<span class="token punctuation">.</span>router <span class="token operator">=</span> router
+        <span class="token comment"># notfiy that router is to be updated</span>
+        registry<span class="token punctuation">.</span>notify<span class="token punctuation">(</span>resources<span class="token punctuation">.</span>ROUTER<span class="token punctuation">,</span> events<span class="token punctuation">.</span>BEFORE_UPDATE<span class="token punctuation">,</span>
+                        self<span class="token punctuation">,</span> router<span class="token operator">=</span>ri<span class="token punctuation">)</span>
+
+        <span class="token comment"># there are two types of dvr rotuers: dvr, dvr_snat</span>
+        ri<span class="token punctuation">.</span>process<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+        <span class="token comment"># notify router has finished updating</span>
+        registry<span class="token punctuation">.</span>notify<span class="token punctuation">(</span>resources<span class="token punctuation">.</span>ROUTER<span class="token punctuation">,</span> events<span class="token punctuation">.</span>AFTER_UPDATE<span class="token punctuation">,</span> self<span class="token punctuation">,</span> router<span class="token operator">=</span>ri<span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>l3_ext_manager<span class="token punctuation">.</span>update_router<span class="token punctuation">(</span>self<span class="token punctuation">.</span>context<span class="token punctuation">,</span> router<span class="token punctuation">)</span>
+
+
+<span class="token comment"># neutron.service.Service</span>
+<span class="token keyword">class</span> <span class="token class-name">Service</span><span class="token punctuation">(</span>n_rpc<span class="token punctuation">.</span>Service<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">start</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        self<span class="token punctuation">.</span>manager<span class="token punctuation">.</span>init_host<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span>Service<span class="token punctuation">,</span> self<span class="token punctuation">)</span><span class="token punctuation">.</span>start<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token keyword">if</span> self<span class="token punctuation">.</span>report_interval<span class="token punctuation">:</span>
+            pulse <span class="token operator">=</span> loopingcall<span class="token punctuation">.</span>FixedIntervalLoopingCall<span class="token punctuation">(</span>self<span class="token punctuation">.</span>report_state<span class="token punctuation">)</span>
+            pulse<span class="token punctuation">.</span>start<span class="token punctuation">(</span>interval<span class="token operator">=</span>self<span class="token punctuation">.</span>report_interval<span class="token punctuation">,</span>
+                        initial_delay<span class="token operator">=</span>self<span class="token punctuation">.</span>report_interval<span class="token punctuation">)</span>
+            self<span class="token punctuation">.</span>timers<span class="token punctuation">.</span>append<span class="token punctuation">(</span>pulse<span class="token punctuation">)</span>
+
+        <span class="token keyword">if</span> self<span class="token punctuation">.</span>periodic_interval<span class="token punctuation">:</span>
+            <span class="token keyword">if</span> self<span class="token punctuation">.</span>periodic_fuzzy_delay<span class="token punctuation">:</span>
+                initial_delay <span class="token operator">=</span> random<span class="token punctuation">.</span>randint<span class="token punctuation">(</span><span class="token number">0</span><span class="token punctuation">,</span> self<span class="token punctuation">.</span>periodic_fuzzy_delay<span class="token punctuation">)</span>
+            <span class="token keyword">else</span><span class="token punctuation">:</span>
+                initial_delay <span class="token operator">=</span> <span class="token boolean">None</span>
+
+            periodic <span class="token operator">=</span> loopingcall<span class="token punctuation">.</span>FixedIntervalLoopingCall<span class="token punctuation">(</span>
+                self<span class="token punctuation">.</span>periodic_tasks<span class="token punctuation">)</span>
+            periodic<span class="token punctuation">.</span>start<span class="token punctuation">(</span>interval<span class="token operator">=</span>self<span class="token punctuation">.</span>periodic_interval<span class="token punctuation">,</span>
+                           initial_delay<span class="token operator">=</span>initial_delay<span class="token punctuation">)</span>
+            self<span class="token punctuation">.</span>timers<span class="token punctuation">.</span>append<span class="token punctuation">(</span>periodic<span class="token punctuation">)</span>
+
+        <span class="token comment"># -----------------------------------</span>
+        <span class="token comment"># going to start those eventlet pools</span>
+        self<span class="token punctuation">.</span>manager<span class="token punctuation">.</span>after_start<span class="token punctuation">(</span><span class="token punctuation">)</span>
+</code></pre></div><p>The code till triggers <code>process</code> method is pretty complex. There are several things to keep in mind</p> <ul><li>Manager (L3NATAgent etc) handles a queued router update notification, and consume it by spawning coroutine in greenlet pool. This task is started by <code>Manager.after_start</code> inside <code>Service.start</code> method.</li> <li><code>router_info</code> object will be created (because it is saved in memory) every time <code>l3-agent</code> is restarted and <code>_process_added_router</code> will be triggered if <code>router_info[key]</code> is empty.</li></ul> <h4 id="core"><a href="#core" aria-hidden="true" class="header-anchor">#</a> CORE</h4> <p>In dvr mode, a router could be further catogrized into at least three modes: <strong>dvr snat</strong>, <strong>dvr local</strong>, <strong>dvr edge</strong>. Generally speaking <strong>dvr snat</strong> is used for snat flow on network node; <strong>dvr local</strong> typically resides on compute nodes; <strong>dvr edge</strong> locates on compute node but not going to handle out-going traffic flows (so floating ip should not be associated on this node). So now it is clear we are interesting in implementation of <strong>dvr local</strong> which is what we have in production.</p> <p>There are two types of routers, one is <code>dvr</code>, ther other is <code>dvr_snat</code>. Their implmentations are <code>DvrLocalRouter</code> and <code>DvrEdgeRouter</code> respectively. DvrLocalRouter is responsible for routing traffic on compute nodes, while DvrEdgeRouter is a NAT gateway.</p> <div class="language-python extra-class"><pre class="language-python"><code><span class="token comment"># handle router on compute node</span>
+<span class="token keyword">class</span> <span class="token class-name">DvrLocalRouter</span><span class="token punctuation">(</span>dvr_router_base<span class="token punctuation">.</span>DvrRouterBase<span class="token punctuation">)</span><span class="token punctuation">:</span>
+
+    <span class="token comment"># entrance</span>
+    <span class="token keyword">def</span> <span class="token function">process</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        ex_gw_port <span class="token operator">=</span> self<span class="token punctuation">.</span>get_ex_gw_port<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token keyword">if</span> ex_gw_port<span class="token punctuation">:</span>
+            <span class="token comment"># agent is 'L3NATAgentWithStateReport' itself</span>
+            <span class="token comment"># fip name is created from network_id</span>
+            self<span class="token punctuation">.</span>fip_ns <span class="token operator">=</span> self<span class="token punctuation">.</span>agent<span class="token punctuation">.</span>get_fip_ns<span class="token punctuation">(</span>ex_gw_port<span class="token punctuation">[</span><span class="token string">'network_id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+            <span class="token comment"># scan port in fip namespace and remove those staled ips</span>
+            self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">.</span>scan_fip_ports<span class="token punctuation">(</span>self<span class="token punctuation">)</span>
+
+        <span class="token builtin">super</span><span class="token punctuation">(</span>DvrLocalRouter<span class="token punctuation">,</span> self<span class="token punctuation">)</span><span class="token punctuation">.</span>process<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+    <span class="token comment"># override parent class method</span>
+    <span class="token keyword">def</span> <span class="token function">process_external</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token comment"># this is a dvr router</span>
+        <span class="token keyword">if</span> self<span class="token punctuation">.</span>agent_conf<span class="token punctuation">.</span>agent_mode <span class="token operator">!=</span> <span class="token punctuation">(</span>
+            n_const<span class="token punctuation">.</span>L3_AGENT_MODE_DVR_NO_EXTERNAL<span class="token punctuation">)</span><span class="token punctuation">:</span>
+            ex_gw_port <span class="token operator">=</span> self<span class="token punctuation">.</span>get_ex_gw_port<span class="token punctuation">(</span><span class="token punctuation">)</span>
+            <span class="token keyword">if</span> ex_gw_port<span class="token punctuation">:</span>
+                <span class="token comment"># make sure fg-xxx tap device exists</span>
+                self<span class="token punctuation">.</span>create_dvr_external_gateway_on_agent<span class="token punctuation">(</span>ex_gw_port<span class="token punctuation">)</span>
+                <span class="token comment"># make sure qrouter &amp; fip are connected</span>
+                self<span class="token punctuation">.</span>connect_rtr_2_fip<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span>DvrLocalRouter<span class="token punctuation">,</span> self<span class="token punctuation">)</span><span class="token punctuation">.</span>process_external<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">create_dvr_external_gateway_on_agent</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ex_gw_port<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        fip_agent_port <span class="token operator">=</span> self<span class="token punctuation">.</span>get_floating_agent_gw_interface<span class="token punctuation">(</span>
+            ex_gw_port<span class="token punctuation">[</span><span class="token string">'network_id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+        <span class="token keyword">if</span> <span class="token operator">not</span> fip_agent_port<span class="token punctuation">:</span>
+            fip_agent_port <span class="token operator">=</span> self<span class="token punctuation">.</span>agent<span class="token punctuation">.</span>plugin_rpc<span class="token punctuation">.</span>get_agent_gateway_port<span class="token punctuation">(</span>
+                self<span class="token punctuation">.</span>agent<span class="token punctuation">.</span>context<span class="token punctuation">,</span> ex_gw_port<span class="token punctuation">[</span><span class="token string">'network_id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+            LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;FloatingIP agent gateway port received from the &quot;</span>
+                      <span class="token string">&quot;plugin: %s&quot;</span><span class="token punctuation">,</span> fip_agent_port<span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">.</span>create_or_update_gateway_port<span class="token punctuation">(</span>fip_agent_port<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">get_router_cidrs</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> device<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token triple-quoted-string string">&quot;&quot;&quot;As no floatingip will be set on the rfp device. Get floatingip from
+        the route of fip namespace.
+        &quot;&quot;&quot;</span>
+        <span class="token keyword">if</span> <span class="token operator">not</span> self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">:</span>
+            <span class="token keyword">return</span> <span class="token builtin">set</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+        fip_ns_name <span class="token operator">=</span> self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">.</span>get_name<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        fip_2_rtr_name <span class="token operator">=</span> self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">.</span>get_int_device_name<span class="token punctuation">(</span>self<span class="token punctuation">.</span>router_id<span class="token punctuation">)</span>
+        device <span class="token operator">=</span> ip_lib<span class="token punctuation">.</span>IPDevice<span class="token punctuation">(</span>fip_2_rtr_name<span class="token punctuation">,</span> namespace<span class="token operator">=</span>fip_ns_name<span class="token punctuation">)</span>
+        <span class="token keyword">if</span> <span class="token operator">not</span> device<span class="token punctuation">.</span>exists<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+            <span class="token keyword">return</span> <span class="token builtin">set</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+        <span class="token keyword">if</span> self<span class="token punctuation">.</span>rtr_fip_subnet <span class="token keyword">is</span> <span class="token boolean">None</span><span class="token punctuation">:</span>
+            self<span class="token punctuation">.</span>rtr_fip_subnet <span class="token operator">=</span> self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">.</span>local_subnets<span class="token punctuation">.</span>allocate<span class="token punctuation">(</span>
+                self<span class="token punctuation">.</span>router_id<span class="token punctuation">)</span>
+        rtr_2_fip<span class="token punctuation">,</span> _fip_2_rtr <span class="token operator">=</span> self<span class="token punctuation">.</span>rtr_fip_subnet<span class="token punctuation">.</span>get_pair<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        exist_routes <span class="token operator">=</span> device<span class="token punctuation">.</span>route<span class="token punctuation">.</span>list_routes<span class="token punctuation">(</span>
+            lib_constants<span class="token punctuation">.</span>IP_VERSION_4<span class="token punctuation">,</span> via<span class="token operator">=</span><span class="token builtin">str</span><span class="token punctuation">(</span>rtr_2_fip<span class="token punctuation">.</span>ip<span class="token punctuation">)</span><span class="token punctuation">)</span>
+        <span class="token keyword">return</span> <span class="token punctuation">{</span>common_utils<span class="token punctuation">.</span>ip_to_cidr<span class="token punctuation">(</span>route<span class="token punctuation">[</span><span class="token string">'cidr'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+                <span class="token keyword">for</span> route <span class="token keyword">in</span> exist_routes<span class="token punctuation">}</span>
+
+    <span class="token keyword">def</span> <span class="token function">add_floating_ip</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> fip<span class="token punctuation">,</span> interface_name<span class="token punctuation">,</span> device<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token comment"># Special Handling for DVR - update FIP namespace</span>
+        ip_cidr <span class="token operator">=</span> common_utils<span class="token punctuation">.</span>ip_to_cidr<span class="token punctuation">(</span>fip<span class="token punctuation">[</span><span class="token string">'floating_ip_address'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+        <span class="token keyword">return</span> self<span class="token punctuation">.</span>floating_ip_added_dist<span class="token punctuation">(</span>fip<span class="token punctuation">,</span> ip_cidr<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">floating_ip_added_dist</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> fip<span class="token punctuation">,</span> fip_cidr<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token triple-quoted-string string">&quot;&quot;&quot;Add floating IP to respective namespace based on agent mode.&quot;&quot;&quot;</span>
+        <span class="token keyword">if</span> fip<span class="token punctuation">.</span>get<span class="token punctuation">(</span>n_const<span class="token punctuation">.</span>DVR_SNAT_BOUND<span class="token punctuation">)</span><span class="token punctuation">:</span>
+            floating_ip_status <span class="token operator">=</span> self<span class="token punctuation">.</span>add_centralized_floatingip<span class="token punctuation">(</span>fip<span class="token punctuation">,</span> fip_cidr<span class="token punctuation">)</span>
+            <span class="token keyword">if</span> floating_ip_status <span class="token operator">==</span> lib_constants<span class="token punctuation">.</span>FLOATINGIP_STATUS_ACTIVE<span class="token punctuation">:</span>
+                self<span class="token punctuation">.</span>centralized_floatingips_set<span class="token punctuation">.</span>add<span class="token punctuation">(</span>fip_cidr<span class="token punctuation">)</span>
+            <span class="token keyword">return</span> floating_ip_status
+        <span class="token keyword">if</span> <span class="token operator">not</span> self<span class="token punctuation">.</span>_check_if_floatingip_bound_to_host<span class="token punctuation">(</span>fip<span class="token punctuation">)</span><span class="token punctuation">:</span>
+            <span class="token keyword">return</span>
+        floating_ip <span class="token operator">=</span> fip<span class="token punctuation">[</span><span class="token string">'floating_ip_address'</span><span class="token punctuation">]</span>
+        fixed_ip <span class="token operator">=</span> fip<span class="token punctuation">[</span><span class="token string">'fixed_ip_address'</span><span class="token punctuation">]</span>
+
+        <span class="token comment"># add rule for routing fip traffic backup to qrouter-xxx</span>
+        self<span class="token punctuation">.</span>_add_floating_ip_rule<span class="token punctuation">(</span>floating_ip<span class="token punctuation">,</span> fixed_ip<span class="token punctuation">)</span>
+        fip_2_rtr_name <span class="token operator">=</span> self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">.</span>get_int_device_name<span class="token punctuation">(</span>self<span class="token punctuation">.</span>router_id<span class="token punctuation">)</span>
+        <span class="token comment">#Add routing rule in fip namespace</span>
+        fip_ns_name <span class="token operator">=</span> self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">.</span>get_name<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token keyword">if</span> self<span class="token punctuation">.</span>rtr_fip_subnet <span class="token keyword">is</span> <span class="token boolean">None</span><span class="token punctuation">:</span>
+            self<span class="token punctuation">.</span>rtr_fip_subnet <span class="token operator">=</span> self<span class="token punctuation">.</span>fip_ns<span class="token punctuation">.</span>local_subnets<span class="token punctuation">.</span>allocate<span class="token punctuation">(</span>
+                self<span class="token punctuation">.</span>router_id<span class="token punctuation">)</span>
+        rtr_2_fip<span class="token punctuation">,</span> __ <span class="token operator">=</span> self<span class="token punctuation">.</span>rtr_fip_subnet<span class="token punctuation">.</span>get_pair<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        device <span class="token operator">=</span> ip_lib<span class="token punctuation">.</span>IPDevice<span class="token punctuation">(</span>fip_2_rtr_name<span class="token punctuation">,</span> namespace<span class="token operator">=</span>fip_ns_name<span class="token punctuation">)</span>
+
+        <span class="token comment"># add this route for proxy arp purpose</span>
+        <span class="token comment"># when fip namespace is created, net.ipv4.conf.xxx.proxy_arp will </span>
+        <span class="token comment"># be set to 1</span>
+        device<span class="token punctuation">.</span>route<span class="token punctuation">.</span>add_route<span class="token punctuation">(</span>fip_cidr<span class="token punctuation">,</span> <span class="token builtin">str</span><span class="token punctuation">(</span>rtr_2_fip<span class="token punctuation">.</span>ip<span class="token punctuation">)</span><span class="token punctuation">)</span>
+</code></pre></div><div class="language-python extra-class"><pre class="language-python"><code><span class="token comment"># handles snat &amp; iptables</span>
+<span class="token keyword">class</span> <span class="token class-name">DvrEdgeRouter</span><span class="token punctuation">(</span>dvr_local_router<span class="token punctuation">.</span>DvrLocalRouter<span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">external_gateway_added</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ex_gw_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token builtin">super</span><span class="token punctuation">(</span>DvrEdgeRouter<span class="token punctuation">,</span> self<span class="token punctuation">)</span><span class="token punctuation">.</span>external_gateway_added<span class="token punctuation">(</span>
+            ex_gw_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span>
+        <span class="token keyword">if</span> self<span class="token punctuation">.</span>_is_this_snat_host<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+            self<span class="token punctuation">.</span>_create_dvr_gateway<span class="token punctuation">(</span>ex_gw_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span>
+            <span class="token comment"># NOTE: When a router is created without a gateway the routes get</span>
+            <span class="token comment"># added to the router namespace, but if we wanted to populate</span>
+            <span class="token comment"># the same routes to the snat namespace after the gateway port</span>
+            <span class="token comment"># is added, we need to call routes_updated here.</span>
+            self<span class="token punctuation">.</span>routes_updated<span class="token punctuation">(</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">,</span> self<span class="token punctuation">.</span>router<span class="token punctuation">[</span><span class="token string">'routes'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+        <span class="token keyword">elif</span> self<span class="token punctuation">.</span>snat_namespace<span class="token punctuation">.</span>exists<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+            <span class="token comment"># This is the case where the snat was moved manually or</span>
+            <span class="token comment"># rescheduled to a different agent when the agent was dead.</span>
+            LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;SNAT was moved or rescheduled to a different host &quot;</span>
+                      <span class="token string">&quot;and does not match with the current host. This is &quot;</span>
+                      <span class="token string">&quot;a stale namespace %s and will be cleared from the &quot;</span>
+                      <span class="token string">&quot;current dvr_snat host.&quot;</span><span class="token punctuation">,</span> self<span class="token punctuation">.</span>snat_namespace<span class="token punctuation">.</span>name<span class="token punctuation">)</span>
+            self<span class="token punctuation">.</span>external_gateway_removed<span class="token punctuation">(</span>ex_gw_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">_create_dvr_gateway</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ex_gw_port<span class="token punctuation">,</span> gw_interface_name<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        snat_ns <span class="token operator">=</span> self<span class="token punctuation">.</span>_create_snat_namespace<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token comment"># connect snat_ports to br_int from SNAT namespace</span>
+        <span class="token keyword">for</span> port <span class="token keyword">in</span> self<span class="token punctuation">.</span>get_snat_interfaces<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+            self<span class="token punctuation">.</span>_plug_snat_port<span class="token punctuation">(</span>port<span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>_external_gateway_added<span class="token punctuation">(</span>ex_gw_port<span class="token punctuation">,</span> gw_interface_name<span class="token punctuation">,</span>
+                                     snat_ns<span class="token punctuation">.</span>name<span class="token punctuation">,</span> preserve_ips<span class="token operator">=</span><span class="token punctuation">[</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>snat_iptables_manager <span class="token operator">=</span> iptables_manager<span class="token punctuation">.</span>IptablesManager<span class="token punctuation">(</span>
+            namespace<span class="token operator">=</span>snat_ns<span class="token punctuation">.</span>name<span class="token punctuation">,</span>
+            use_ipv6<span class="token operator">=</span>self<span class="token punctuation">.</span>use_ipv6<span class="token punctuation">)</span>
+
+        self<span class="token punctuation">.</span>_initialize_address_scope_iptables<span class="token punctuation">(</span>self<span class="token punctuation">.</span>snat_iptables_manager<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">_plug_snat_port</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> port<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        interface_name <span class="token operator">=</span> self<span class="token punctuation">.</span>_get_snat_int_device_name<span class="token punctuation">(</span>port<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>_internal_network_added<span class="token punctuation">(</span>
+            self<span class="token punctuation">.</span>snat_namespace<span class="token punctuation">.</span>name<span class="token punctuation">,</span> port<span class="token punctuation">[</span><span class="token string">'network_id'</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+            port<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">,</span> port<span class="token punctuation">[</span><span class="token string">'fixed_ips'</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+            port<span class="token punctuation">[</span><span class="token string">'mac_address'</span><span class="token punctuation">]</span><span class="token punctuation">,</span> interface_name<span class="token punctuation">,</span>
+            lib_constants<span class="token punctuation">.</span>SNAT_INT_DEV_PREFIX<span class="token punctuation">,</span>
+            mtu<span class="token operator">=</span>port<span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'mtu'</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+</code></pre></div><div class="language-python extra-class"><pre class="language-python"><code><span class="token comment"># base class</span>
+<span class="token keyword">class</span> <span class="token class-name">RouterInfo</span><span class="token punctuation">(</span><span class="token builtin">object</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+    <span class="token keyword">def</span> <span class="token function">process_external</span><span class="token punctuation">(</span>self<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        fip_statuses <span class="token operator">=</span> <span class="token punctuation">{</span><span class="token punctuation">}</span>
+        <span class="token keyword">try</span><span class="token punctuation">:</span>
+            <span class="token keyword">with</span> self<span class="token punctuation">.</span>iptables_manager<span class="token punctuation">.</span>defer_apply<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+                ex_gw_port <span class="token operator">=</span> self<span class="token punctuation">.</span>get_ex_gw_port<span class="token punctuation">(</span><span class="token punctuation">)</span>
+                self<span class="token punctuation">.</span>_process_external_gateway<span class="token punctuation">(</span>ex_gw_port<span class="token punctuation">)</span>
+                <span class="token keyword">if</span> <span class="token operator">not</span> ex_gw_port<span class="token punctuation">:</span>
+                    <span class="token keyword">return</span>
+
+                <span class="token comment"># Process SNAT/DNAT rules and addresses for floating IPs</span>
+                self<span class="token punctuation">.</span>process_snat_dnat_for_fip<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+            <span class="token comment"># Once NAT rules for floating IPs are safely in place</span>
+            <span class="token comment"># configure their addresses on the external gateway port</span>
+            interface_name <span class="token operator">=</span> self<span class="token punctuation">.</span>get_external_device_interface_name<span class="token punctuation">(</span>
+                ex_gw_port<span class="token punctuation">)</span>
+            fip_statuses <span class="token operator">=</span> self<span class="token punctuation">.</span>configure_fip_addresses<span class="token punctuation">(</span>interface_name<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">configure_fip_addresses</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">try</span><span class="token punctuation">:</span>
+            <span class="token keyword">return</span> self<span class="token punctuation">.</span>process_floating_ip_addresses<span class="token punctuation">(</span>interface_name<span class="token punctuation">)</span>
+        <span class="token keyword">except</span> Exception<span class="token punctuation">:</span>
+            <span class="token comment"># TODO(salv-orlando): Less broad catching</span>
+            msg <span class="token operator">=</span> _<span class="token punctuation">(</span><span class="token string">'L3 agent failure to setup floating IPs'</span><span class="token punctuation">)</span>
+            LOG<span class="token punctuation">.</span>exception<span class="token punctuation">(</span>msg<span class="token punctuation">)</span>
+            <span class="token keyword">raise</span> n_exc<span class="token punctuation">.</span>FloatingIpSetupException<span class="token punctuation">(</span>msg<span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">create_or_update_gateway_port</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> agent_gateway_port<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        interface_name <span class="token operator">=</span> self<span class="token punctuation">.</span>get_ext_device_name<span class="token punctuation">(</span>agent_gateway_port<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+        <span class="token comment"># The lock is used to make sure another thread doesn't call to</span>
+        <span class="token comment"># update the gateway port before we are done initializing things.</span>
+        <span class="token keyword">with</span> self<span class="token punctuation">.</span>_fip_port_lock<span class="token punctuation">(</span>interface_name<span class="token punctuation">)</span><span class="token punctuation">:</span>
+            is_first <span class="token operator">=</span> self<span class="token punctuation">.</span>subscribe<span class="token punctuation">(</span>agent_gateway_port<span class="token punctuation">[</span><span class="token string">'network_id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+            <span class="token keyword">if</span> is_first<span class="token punctuation">:</span>
+                self<span class="token punctuation">.</span>_create_gateway_port<span class="token punctuation">(</span>agent_gateway_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span>
+            <span class="token comment"># skip</span>
+
+    <span class="token keyword">def</span> <span class="token function">_create_gateway_port</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ex_gw_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token triple-quoted-string string">&quot;&quot;&quot;Create namespace, request port creationg from Plugin,
+           then configure Floating IP gateway port.
+        &quot;&quot;&quot;</span>
+        self<span class="token punctuation">.</span>create<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+        LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;DVR: adding gateway interface: %s&quot;</span><span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span>
+        ns_name <span class="token operator">=</span> self<span class="token punctuation">.</span>get_name<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>driver<span class="token punctuation">.</span>plug<span class="token punctuation">(</span>ex_gw_port<span class="token punctuation">[</span><span class="token string">'network_id'</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+                         ex_gw_port<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+                         interface_name<span class="token punctuation">,</span>
+                         ex_gw_port<span class="token punctuation">[</span><span class="token string">'mac_address'</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+                         bridge<span class="token operator">=</span>self<span class="token punctuation">.</span>agent_conf<span class="token punctuation">.</span>external_network_bridge<span class="token punctuation">,</span>
+                         namespace<span class="token operator">=</span>ns_name<span class="token punctuation">,</span>
+                         prefix<span class="token operator">=</span>FIP_EXT_DEV_PREFIX<span class="token punctuation">,</span>
+                         mtu<span class="token operator">=</span>ex_gw_port<span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'mtu'</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+
+        <span class="token comment"># Remove stale fg devices</span>
+        ip_wrapper <span class="token operator">=</span> ip_lib<span class="token punctuation">.</span>IPWrapper<span class="token punctuation">(</span>namespace<span class="token operator">=</span>ns_name<span class="token punctuation">)</span>
+        devices <span class="token operator">=</span> ip_wrapper<span class="token punctuation">.</span>get_devices<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token keyword">for</span> device <span class="token keyword">in</span> devices<span class="token punctuation">:</span>
+            name <span class="token operator">=</span> device<span class="token punctuation">.</span>name
+            <span class="token keyword">if</span> name<span class="token punctuation">.</span>startswith<span class="token punctuation">(</span>FIP_EXT_DEV_PREFIX<span class="token punctuation">)</span> <span class="token operator">and</span> name <span class="token operator">!=</span> interface_name<span class="token punctuation">:</span>
+                LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">'DVR: unplug: %s'</span><span class="token punctuation">,</span> name<span class="token punctuation">)</span>
+                ext_net_bridge <span class="token operator">=</span> self<span class="token punctuation">.</span>agent_conf<span class="token punctuation">.</span>external_network_bridge
+                self<span class="token punctuation">.</span>driver<span class="token punctuation">.</span>unplug<span class="token punctuation">(</span>name<span class="token punctuation">,</span>
+                                   bridge<span class="token operator">=</span>ext_net_bridge<span class="token punctuation">,</span>
+                                   namespace<span class="token operator">=</span>ns_name<span class="token punctuation">,</span>
+                                   prefix<span class="token operator">=</span>FIP_EXT_DEV_PREFIX<span class="token punctuation">)</span>
+
+        ip_cidrs <span class="token operator">=</span> common_utils<span class="token punctuation">.</span>fixed_ip_cidrs<span class="token punctuation">(</span>ex_gw_port<span class="token punctuation">[</span><span class="token string">'fixed_ips'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>driver<span class="token punctuation">.</span>init_l3<span class="token punctuation">(</span>interface_name<span class="token punctuation">,</span> ip_cidrs<span class="token punctuation">,</span> namespace<span class="token operator">=</span>ns_name<span class="token punctuation">,</span>
+                            clean_connections<span class="token operator">=</span><span class="token boolean">True</span><span class="token punctuation">)</span>
+
+        self<span class="token punctuation">.</span>agent_gateway_port <span class="token operator">=</span> ex_gw_port
+
+        <span class="token comment"># enable proxy arp</span>
+        cmd <span class="token operator">=</span> <span class="token punctuation">[</span><span class="token string">'sysctl'</span><span class="token punctuation">,</span> <span class="token string">'-w'</span><span class="token punctuation">,</span> <span class="token string">'net.ipv4.conf.%s.proxy_arp=1'</span> <span class="token operator">%</span> interface_name<span class="token punctuation">]</span>
+        ip_wrapper<span class="token punctuation">.</span>netns<span class="token punctuation">.</span>execute<span class="token punctuation">(</span>cmd<span class="token punctuation">,</span> check_exit_code<span class="token operator">=</span><span class="token boolean">False</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">process_floating_ip_addresses</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token triple-quoted-string string">&quot;&quot;&quot;Configure IP addresses on router's external gateway interface.
+
+        Ensures addresses for existing floating IPs and cleans up
+        those that should not longer be configured.
+        &quot;&quot;&quot;</span>
+
+        fip_statuses <span class="token operator">=</span> <span class="token punctuation">{</span><span class="token punctuation">}</span>
+        <span class="token keyword">if</span> interface_name <span class="token keyword">is</span> <span class="token boolean">None</span><span class="token punctuation">:</span>
+            LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">'No Interface for floating IPs router: %s'</span><span class="token punctuation">,</span>
+                      self<span class="token punctuation">.</span>router<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+            <span class="token keyword">return</span> fip_statuses
+
+        device <span class="token operator">=</span> ip_lib<span class="token punctuation">.</span>IPDevice<span class="token punctuation">(</span>interface_name<span class="token punctuation">,</span> namespace<span class="token operator">=</span>self<span class="token punctuation">.</span>ns_name<span class="token punctuation">)</span>
+        existing_cidrs <span class="token operator">=</span> self<span class="token punctuation">.</span>get_router_cidrs<span class="token punctuation">(</span>device<span class="token punctuation">)</span>
+        new_cidrs <span class="token operator">=</span> <span class="token builtin">set</span><span class="token punctuation">(</span><span class="token punctuation">)</span>
+        gw_cidrs <span class="token operator">=</span> self<span class="token punctuation">.</span>_get_gw_ips_cidr<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+        floating_ips <span class="token operator">=</span> self<span class="token punctuation">.</span>get_floating_ips<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        <span class="token comment"># Loop once to ensure that floating ips are configured.</span>
+        <span class="token keyword">for</span> fip <span class="token keyword">in</span> floating_ips<span class="token punctuation">:</span>
+            fip_ip <span class="token operator">=</span> fip<span class="token punctuation">[</span><span class="token string">'floating_ip_address'</span><span class="token punctuation">]</span>
+            ip_cidr <span class="token operator">=</span> common_utils<span class="token punctuation">.</span>ip_to_cidr<span class="token punctuation">(</span>fip_ip<span class="token punctuation">)</span>
+            new_cidrs<span class="token punctuation">.</span>add<span class="token punctuation">(</span>ip_cidr<span class="token punctuation">)</span>
+            fip_statuses<span class="token punctuation">[</span>fip<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">]</span> <span class="token operator">=</span> lib_constants<span class="token punctuation">.</span>FLOATINGIP_STATUS_ACTIVE
+            cent_router_cidrs <span class="token operator">=</span> self<span class="token punctuation">.</span>get_centralized_router_cidrs<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+            <span class="token keyword">if</span> ip_cidr <span class="token operator">not</span> <span class="token keyword">in</span> existing_cidrs<span class="token punctuation">:</span>
+                <span class="token comment"># add_floating_ip is implemented by dvr local object</span>
+                fip_statuses<span class="token punctuation">[</span>fip<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">]</span> <span class="token operator">=</span> self<span class="token punctuation">.</span>add_floating_ip<span class="token punctuation">(</span>
+                    fip<span class="token punctuation">,</span> interface_name<span class="token punctuation">,</span> device<span class="token punctuation">)</span>
+                LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">'Floating ip %(id)s added, status %(status)s'</span><span class="token punctuation">,</span>
+                          <span class="token punctuation">{</span><span class="token string">'id'</span><span class="token punctuation">:</span> fip<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">,</span>
+                           <span class="token string">'status'</span><span class="token punctuation">:</span> fip_statuses<span class="token punctuation">.</span>get<span class="token punctuation">(</span>fip<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">}</span><span class="token punctuation">)</span>
+            <span class="token keyword">elif</span> <span class="token punctuation">(</span>fip_ip <span class="token keyword">in</span> self<span class="token punctuation">.</span>fip_map <span class="token operator">and</span>
+                  self<span class="token punctuation">.</span>fip_map<span class="token punctuation">[</span>fip_ip<span class="token punctuation">]</span> <span class="token operator">!=</span> fip<span class="token punctuation">[</span><span class="token string">'fixed_ip_address'</span><span class="token punctuation">]</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+                LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;Floating IP was moved from fixed IP &quot;</span>
+                          <span class="token string">&quot;%(old)s to %(new)s&quot;</span><span class="token punctuation">,</span>
+                          <span class="token punctuation">{</span><span class="token string">'old'</span><span class="token punctuation">:</span> self<span class="token punctuation">.</span>fip_map<span class="token punctuation">[</span>fip_ip<span class="token punctuation">]</span><span class="token punctuation">,</span>
+                           <span class="token string">'new'</span><span class="token punctuation">:</span> fip<span class="token punctuation">[</span><span class="token string">'fixed_ip_address'</span><span class="token punctuation">]</span><span class="token punctuation">}</span><span class="token punctuation">)</span>
+                fip_statuses<span class="token punctuation">[</span>fip<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">]</span> <span class="token operator">=</span> self<span class="token punctuation">.</span>move_floating_ip<span class="token punctuation">(</span>fip<span class="token punctuation">)</span>
+            <span class="token keyword">elif</span> <span class="token punctuation">(</span>ip_cidr <span class="token keyword">in</span> cent_router_cidrs <span class="token operator">and</span>
+                fip<span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'host'</span><span class="token punctuation">)</span> <span class="token operator">==</span> self<span class="token punctuation">.</span>host<span class="token punctuation">)</span><span class="token punctuation">:</span>
+                LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;Floating IP is migrating from centralized &quot;</span>
+                          <span class="token string">&quot;to distributed: %s&quot;</span><span class="token punctuation">,</span> fip<span class="token punctuation">)</span>
+                fip_statuses<span class="token punctuation">[</span>fip<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">]</span> <span class="token operator">=</span> self<span class="token punctuation">.</span>migrate_centralized_floating_ip<span class="token punctuation">(</span>
+                    fip<span class="token punctuation">,</span> interface_name<span class="token punctuation">,</span> device<span class="token punctuation">)</span>
+            <span class="token keyword">elif</span> fip_statuses<span class="token punctuation">[</span>fip<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">]</span> <span class="token operator">==</span> fip<span class="token punctuation">[</span><span class="token string">'status'</span><span class="token punctuation">]</span><span class="token punctuation">:</span>
+                <span class="token comment"># mark the status as not changed. we can't remove it because</span>
+                <span class="token comment"># that's how the caller determines that it was removed</span>
+                fip_statuses<span class="token punctuation">[</span>fip<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">]</span> <span class="token operator">=</span> FLOATINGIP_STATUS_NOCHANGE
+        fips_to_remove <span class="token operator">=</span> <span class="token punctuation">(</span>
+            ip_cidr <span class="token keyword">for</span> ip_cidr <span class="token keyword">in</span> existing_cidrs <span class="token operator">-</span> new_cidrs <span class="token operator">-</span> gw_cidrs
+            <span class="token keyword">if</span> common_utils<span class="token punctuation">.</span>is_cidr_host<span class="token punctuation">(</span>ip_cidr<span class="token punctuation">)</span><span class="token punctuation">)</span>
+        <span class="token keyword">for</span> ip_cidr <span class="token keyword">in</span> fips_to_remove<span class="token punctuation">:</span>
+            LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;Removing floating ip %s from interface %s in &quot;</span>
+                      <span class="token string">&quot;namespace %s&quot;</span><span class="token punctuation">,</span> ip_cidr<span class="token punctuation">,</span> interface_name<span class="token punctuation">,</span> self<span class="token punctuation">.</span>ns_name<span class="token punctuation">)</span>
+            self<span class="token punctuation">.</span>remove_floating_ip<span class="token punctuation">(</span>device<span class="token punctuation">,</span> ip_cidr<span class="token punctuation">)</span>
+
+        <span class="token keyword">return</span> fip_statuses
+
+    <span class="token keyword">def</span> <span class="token function">_internal_network_added</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ns_name<span class="token punctuation">,</span> network_id<span class="token punctuation">,</span> port_id<span class="token punctuation">,</span>
+                                fixed_ips<span class="token punctuation">,</span> mac_address<span class="token punctuation">,</span>
+                                interface_name<span class="token punctuation">,</span> prefix<span class="token punctuation">,</span> mtu<span class="token operator">=</span><span class="token boolean">None</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+        LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;adding internal network: prefix(%s), port(%s)&quot;</span><span class="token punctuation">,</span>
+                  prefix<span class="token punctuation">,</span> port_id<span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>driver<span class="token punctuation">.</span>plug<span class="token punctuation">(</span>network_id<span class="token punctuation">,</span> port_id<span class="token punctuation">,</span> interface_name<span class="token punctuation">,</span> mac_address<span class="token punctuation">,</span>
+                         namespace<span class="token operator">=</span>ns_name<span class="token punctuation">,</span>
+                         prefix<span class="token operator">=</span>prefix<span class="token punctuation">,</span> mtu<span class="token operator">=</span>mtu<span class="token punctuation">)</span>
+
+        ip_cidrs <span class="token operator">=</span> common_utils<span class="token punctuation">.</span>fixed_ip_cidrs<span class="token punctuation">(</span>fixed_ips<span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>driver<span class="token punctuation">.</span>init_router_port<span class="token punctuation">(</span>
+            interface_name<span class="token punctuation">,</span> ip_cidrs<span class="token punctuation">,</span> namespace<span class="token operator">=</span>ns_name<span class="token punctuation">)</span>
+        <span class="token keyword">for</span> fixed_ip <span class="token keyword">in</span> fixed_ips<span class="token punctuation">:</span>
+            ip_lib<span class="token punctuation">.</span>send_ip_addr_adv_notif<span class="token punctuation">(</span>ns_name<span class="token punctuation">,</span>
+                                          interface_name<span class="token punctuation">,</span>
+                                          fixed_ip<span class="token punctuation">[</span><span class="token string">'ip_address'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+</code></pre></div><div class="language-python extra-class"><pre class="language-python"><code><span class="token comment"># implements</span>
+<span class="token keyword">class</span> <span class="token class-name">FipNamespace</span><span class="token punctuation">(</span>namespaces<span class="token punctuation">.</span>Namespace<span class="token punctuation">)</span><span class="token punctuation">:</span>
+
+    <span class="token comment"># create fg-xxx tap device inside of fip namespace</span>
+    <span class="token keyword">def</span> <span class="token function">create_or_update_gateway_port</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> agent_gateway_port<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        interface_name <span class="token operator">=</span> self<span class="token punctuation">.</span>get_ext_device_name<span class="token punctuation">(</span>agent_gateway_port<span class="token punctuation">[</span><span class="token string">'id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+        <span class="token comment"># The lock is used to make sure another thread doesn't call to</span>
+        <span class="token comment"># update the gateway port before we are done initializing things.</span>
+        <span class="token keyword">with</span> self<span class="token punctuation">.</span>_fip_port_lock<span class="token punctuation">(</span>interface_name<span class="token punctuation">)</span><span class="token punctuation">:</span>
+            is_first <span class="token operator">=</span> self<span class="token punctuation">.</span>subscribe<span class="token punctuation">(</span>agent_gateway_port<span class="token punctuation">[</span><span class="token string">'network_id'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+            <span class="token keyword">if</span> is_first<span class="token punctuation">:</span>
+                <span class="token comment"># Check for subnets that are populated for the agent</span>
+                <span class="token comment"># gateway port that was created on the server.</span>
+                <span class="token keyword">if</span> <span class="token string">'subnets'</span> <span class="token operator">not</span> <span class="token keyword">in</span> agent_gateway_port<span class="token punctuation">:</span>
+                    <span class="token keyword">return</span>
+                self<span class="token punctuation">.</span>_create_gateway_port<span class="token punctuation">(</span>agent_gateway_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span>
+            <span class="token keyword">else</span><span class="token punctuation">:</span>
+                <span class="token keyword">try</span><span class="token punctuation">:</span>
+                    self<span class="token punctuation">.</span>_update_gateway_port<span class="token punctuation">(</span>
+                        agent_gateway_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span>
+                <span class="token keyword">except</span> Exception<span class="token punctuation">:</span>
+                    <span class="token keyword">pass</span>
+
+    <span class="token keyword">def</span> <span class="token function">_update_gateway_port</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> agent_gateway_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token keyword">if</span> <span class="token punctuation">(</span>self<span class="token punctuation">.</span>agent_gateway_port <span class="token operator">and</span>
+            <span class="token operator">not</span> self<span class="token punctuation">.</span>_check_for_gateway_ip_change<span class="token punctuation">(</span>agent_gateway_port<span class="token punctuation">)</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+                <span class="token keyword">return</span>
+        <span class="token comment"># Caller already holding lock</span>
+        self<span class="token punctuation">.</span>_update_gateway_route<span class="token punctuation">(</span>
+            agent_gateway_port<span class="token punctuation">,</span> interface_name<span class="token punctuation">,</span> tbl_index<span class="token operator">=</span><span class="token boolean">None</span><span class="token punctuation">)</span>
+
+        <span class="token comment"># Cache the agent gateway port after successfully updating</span>
+        <span class="token comment"># the gateway route, so that checking on self.agent_gateway_port</span>
+        <span class="token comment"># will be a valid check</span>
+        self<span class="token punctuation">.</span>agent_gateway_port <span class="token operator">=</span> agent_gateway_port
+
+    <span class="token keyword">def</span> <span class="token function">_update_gateway_route</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> agent_gateway_port<span class="token punctuation">,</span>
+                             interface_name<span class="token punctuation">,</span> tbl_index<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        ns_name <span class="token operator">=</span> self<span class="token punctuation">.</span>get_name<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        ipd <span class="token operator">=</span> ip_lib<span class="token punctuation">.</span>IPDevice<span class="token punctuation">(</span>interface_name<span class="token punctuation">,</span> namespace<span class="token operator">=</span>ns_name<span class="token punctuation">)</span>
+        <span class="token comment"># If the 'fg-' device doesn't exist in the namespace then trying</span>
+        <span class="token comment"># to send advertisements or configure the default route will just</span>
+        <span class="token comment"># throw exceptions.  Unsubscribe this external network so that</span>
+        <span class="token comment"># the next call will trigger the interface to be plugged.</span>
+        <span class="token keyword">if</span> <span class="token operator">not</span> ipd<span class="token punctuation">.</span>exists<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+            LOG<span class="token punctuation">.</span>warning<span class="token punctuation">(</span><span class="token string">'DVR: FIP gateway port with interface '</span>
+                        <span class="token string">'name: %(device)s does not exist in the given '</span>
+                        <span class="token string">'namespace: %(ns)s'</span><span class="token punctuation">,</span> <span class="token punctuation">{</span><span class="token string">'device'</span><span class="token punctuation">:</span> interface_name<span class="token punctuation">,</span>
+                                              <span class="token string">'ns'</span><span class="token punctuation">:</span> ns_name<span class="token punctuation">}</span><span class="token punctuation">)</span>
+            msg <span class="token operator">=</span> _<span class="token punctuation">(</span><span class="token string">'DVR: Gateway update route in FIP namespace failed, retry '</span>
+                    <span class="token string">'should be attempted on next call'</span><span class="token punctuation">)</span>
+            <span class="token keyword">raise</span> n_exc<span class="token punctuation">.</span>FloatingIpSetupException<span class="token punctuation">(</span>msg<span class="token punctuation">)</span>
+
+        <span class="token keyword">for</span> fixed_ip <span class="token keyword">in</span> agent_gateway_port<span class="token punctuation">[</span><span class="token string">'fixed_ips'</span><span class="token punctuation">]</span><span class="token punctuation">:</span>
+            ip_lib<span class="token punctuation">.</span>send_ip_addr_adv_notif<span class="token punctuation">(</span>ns_name<span class="token punctuation">,</span>
+                                          interface_name<span class="token punctuation">,</span>
+                                          fixed_ip<span class="token punctuation">[</span><span class="token string">'ip_address'</span><span class="token punctuation">]</span><span class="token punctuation">)</span>
+
+        <span class="token keyword">for</span> subnet <span class="token keyword">in</span> agent_gateway_port<span class="token punctuation">[</span><span class="token string">'subnets'</span><span class="token punctuation">]</span><span class="token punctuation">:</span>
+            gw_ip <span class="token operator">=</span> subnet<span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'gateway_ip'</span><span class="token punctuation">)</span>
+            <span class="token keyword">if</span> gw_ip<span class="token punctuation">:</span>
+                is_gateway_not_in_subnet <span class="token operator">=</span> <span class="token operator">not</span> ipam_utils<span class="token punctuation">.</span>check_subnet_ip<span class="token punctuation">(</span>
+                                                subnet<span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'cidr'</span><span class="token punctuation">)</span><span class="token punctuation">,</span> gw_ip<span class="token punctuation">)</span>
+                <span class="token keyword">if</span> is_gateway_not_in_subnet<span class="token punctuation">:</span>
+                    ipd<span class="token punctuation">.</span>route<span class="token punctuation">.</span>add_route<span class="token punctuation">(</span>gw_ip<span class="token punctuation">,</span> scope<span class="token operator">=</span><span class="token string">'link'</span><span class="token punctuation">)</span>
+                self<span class="token punctuation">.</span>_add_default_gateway_for_fip<span class="token punctuation">(</span>gw_ip<span class="token punctuation">,</span> ipd<span class="token punctuation">,</span> tbl_index<span class="token punctuation">)</span>
+            <span class="token keyword">else</span><span class="token punctuation">:</span>
+                current_gateway <span class="token operator">=</span> ipd<span class="token punctuation">.</span>route<span class="token punctuation">.</span>get_gateway<span class="token punctuation">(</span><span class="token punctuation">)</span>
+                <span class="token keyword">if</span> current_gateway <span class="token operator">and</span> current_gateway<span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'gateway'</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+                    ipd<span class="token punctuation">.</span>route<span class="token punctuation">.</span>delete_gateway<span class="token punctuation">(</span>current_gateway<span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'gateway'</span><span class="token punctuation">)</span><span class="token punctuation">)</span>
+
+    <span class="token keyword">def</span> <span class="token function">create_rtr_2_fip_link</span><span class="token punctuation">(</span>self<span class="token punctuation">,</span> ri<span class="token punctuation">)</span><span class="token punctuation">:</span>
+        <span class="token triple-quoted-string string">&quot;&quot;&quot;Create interface between router and Floating IP namespace.&quot;&quot;&quot;</span>
+        LOG<span class="token punctuation">.</span>debug<span class="token punctuation">(</span><span class="token string">&quot;Create FIP link interfaces for router %s&quot;</span><span class="token punctuation">,</span> ri<span class="token punctuation">.</span>router_id<span class="token punctuation">)</span>
+        rtr_2_fip_name <span class="token operator">=</span> self<span class="token punctuation">.</span>get_rtr_ext_device_name<span class="token punctuation">(</span>ri<span class="token punctuation">.</span>router_id<span class="token punctuation">)</span>
+        fip_2_rtr_name <span class="token operator">=</span> self<span class="token punctuation">.</span>get_int_device_name<span class="token punctuation">(</span>ri<span class="token punctuation">.</span>router_id<span class="token punctuation">)</span>
+        fip_ns_name <span class="token operator">=</span> self<span class="token punctuation">.</span>get_name<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+        <span class="token comment"># add link local IP to interface</span>
+        <span class="token keyword">if</span> ri<span class="token punctuation">.</span>rtr_fip_subnet <span class="token keyword">is</span> <span class="token boolean">None</span><span class="token punctuation">:</span>
+            ri<span class="token punctuation">.</span>rtr_fip_subnet <span class="token operator">=</span> self<span class="token punctuation">.</span>local_subnets<span class="token punctuation">.</span>allocate<span class="token punctuation">(</span>ri<span class="token punctuation">.</span>router_id<span class="token punctuation">)</span>
+        rtr_2_fip<span class="token punctuation">,</span> fip_2_rtr <span class="token operator">=</span> ri<span class="token punctuation">.</span>rtr_fip_subnet<span class="token punctuation">.</span>get_pair<span class="token punctuation">(</span><span class="token punctuation">)</span>
+        rtr_2_fip_dev <span class="token operator">=</span> ip_lib<span class="token punctuation">.</span>IPDevice<span class="token punctuation">(</span>rtr_2_fip_name<span class="token punctuation">,</span> namespace<span class="token operator">=</span>ri<span class="token punctuation">.</span>ns_name<span class="token punctuation">)</span>
+        fip_2_rtr_dev <span class="token operator">=</span> ip_lib<span class="token punctuation">.</span>IPDevice<span class="token punctuation">(</span>fip_2_rtr_name<span class="token punctuation">,</span> namespace<span class="token operator">=</span>fip_ns_name<span class="token punctuation">)</span>
+
+        <span class="token keyword">if</span> <span class="token operator">not</span> rtr_2_fip_dev<span class="token punctuation">.</span>exists<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">:</span>
+            ip_wrapper <span class="token operator">=</span> ip_lib<span class="token punctuation">.</span>IPWrapper<span class="token punctuation">(</span>namespace<span class="token operator">=</span>ri<span class="token punctuation">.</span>ns_name<span class="token punctuation">)</span>
+            rtr_2_fip_dev<span class="token punctuation">,</span> fip_2_rtr_dev <span class="token operator">=</span> ip_wrapper<span class="token punctuation">.</span>add_veth<span class="token punctuation">(</span>rtr_2_fip_name<span class="token punctuation">,</span>
+                                                               fip_2_rtr_name<span class="token punctuation">,</span>
+                                                               fip_ns_name<span class="token punctuation">)</span>
+            mtu <span class="token operator">=</span> ri<span class="token punctuation">.</span>get_ex_gw_port<span class="token punctuation">(</span><span class="token punctuation">)</span><span class="token punctuation">.</span>get<span class="token punctuation">(</span><span class="token string">'mtu'</span><span class="token punctuation">)</span>
+            <span class="token keyword">if</span> mtu<span class="token punctuation">:</span>
+                rtr_2_fip_dev<span class="token punctuation">.</span>link<span class="token punctuation">.</span>set_mtu<span class="token punctuation">(</span>mtu<span class="token punctuation">)</span>
+                fip_2_rtr_dev<span class="token punctuation">.</span>link<span class="token punctuation">.</span>set_mtu<span class="token punctuation">(</span>mtu<span class="token punctuation">)</span>
+            rtr_2_fip_dev<span class="token punctuation">.</span>link<span class="token punctuation">.</span>set_up<span class="token punctuation">(</span><span class="token punctuation">)</span>
+            fip_2_rtr_dev<span class="token punctuation">.</span>link<span class="token punctuation">.</span>set_up<span class="token punctuation">(</span><span class="token punctuation">)</span>
+
+        self<span class="token punctuation">.</span>_add_cidr_to_device<span class="token punctuation">(</span>rtr_2_fip_dev<span class="token punctuation">,</span> <span class="token builtin">str</span><span class="token punctuation">(</span>rtr_2_fip<span class="token punctuation">)</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>_add_cidr_to_device<span class="token punctuation">(</span>fip_2_rtr_dev<span class="token punctuation">,</span> <span class="token builtin">str</span><span class="token punctuation">(</span>fip_2_rtr<span class="token punctuation">)</span><span class="token punctuation">)</span>
+        self<span class="token punctuation">.</span>_add_rtr_ext_route_rule_to_route_table<span class="token punctuation">(</span>ri<span class="token punctuation">,</span> fip_2_rtr<span class="token punctuation">,</span>
+                                                    fip_2_rtr_name<span class="token punctuation">)</span>
+</code></pre></div><h4 id="network-flow-review"><a href="#network-flow-review" aria-hidden="true" class="header-anchor">#</a> NETWORK FLOW REVIEW</h4> <h5 id="fixed-ip"><a href="#fixed-ip" aria-hidden="true" class="header-anchor">#</a> FIXED IP</h5> <div class="language-raw extra-class"><pre class="language-text"><code>vm -&gt; qr-xxx (on compute node) -&gt; sg-xxx (snat) -&gt; outside
+outside -&gt;  sg-xxx (snat) -&gt; qr-xxx (network node) -&gt; vm
+</code></pre></div><h5 id="floating-ip"><a href="#floating-ip" aria-hidden="true" class="header-anchor">#</a> FLOATING IP</h5> <div class="language-raw extra-class"><pre class="language-text"><code>vm -&gt; qr-xxx (snat/dnat) -&gt; rfp-xxx -&gt; fpr-xxx -&gt; fg-xxx -&gt; outside
+outside -&gt; fg-xxx -&gt; fpr-xxx -&gt; rfp-xxx (snat/dnat) -&gt; qr-xxx -&gt; vm
+</code></pre></div><h3 id="random-rants"><a href="#random-rants" aria-hidden="true" class="header-anchor">#</a> RANDOM RANTS</h3> <ul><li>My question is why <code>fip</code> namespace is necessary? Isn't still possible to make floating ip associate with each router, like what is done in legacy rotuer implementations?</li></ul> <h3 id="fip-references"><a href="#fip-references" aria-hidden="true" class="header-anchor">#</a> FIP REFERENCES</h3> <ul><li><a href="https://assafmuller.com/2015/04/15/distributed-virtual-routing-floating-ips/" target="_blank" rel="noopener noreferrer">most refered to article on DVR, very informative<svg xmlns="http://www.w3.org/2000/svg" aria-hidden="true" x="0px" y="0px" viewBox="0 0 100 100" width="15" height="15" class="icon outbound"><path fill="currentColor" d="M18.8,85.1h56l0,0c2.2,0,4-1.8,4-4v-32h-8v28h-48v-48h28v-8h-32l0,0c-2.2,0-4,1.8-4,4v56C14.8,83.3,16.6,85.1,18.8,85.1z"></path> <polygon fill="currentColor" points="45.7,48.7 51.3,54.3 77.2,28.5 77.2,37.2 85.2,37.2 85.2,14.9 62.8,14.9 62.8,22.9 71.5,22.9"></polygon></svg></a></li></ul></div> <div class="page-edit"><!----> <!----></div> <!----> </div> <!----></div></div>
+    <script src="/assets/js/7.642f35ed.js" defer></script><script src="/assets/js/app.c3760c75.js" defer></script>
+  </body>
+</html>
